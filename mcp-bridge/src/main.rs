@@ -1,5 +1,5 @@
 #![recursion_limit = "256"]
-//! FWOK MCP stdio executable entry point. This file only wires modules and runs the loop.
+//! MCP bridge executable entry point. This file only wires modules and runs the request loop.
 mod bridge;
 mod catalog;
 mod rpc;

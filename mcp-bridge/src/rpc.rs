@@ -23,7 +23,7 @@ pub fn dispatch(request: &Value) -> Value {
     let id = request.get("id").cloned().unwrap_or(Value::Null);
     match request.get("method").and_then(Value::as_str).unwrap_or("") {
         "initialize" => {
-            json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"fwok-mcp","version":"0.2.0"},"capabilities":{"tools":{"listChanged":false}}}})
+            json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"mcp-bridge","version":"0.2.0"},"capabilities":{"tools":{"listChanged":false}}}})
         }
         "notifications/initialized" | "notifications/cancelled" => Value::Null,
         "tools/list" => json!({"jsonrpc":"2.0","id":id,"result":{"tools":catalog::tools()}}),
@@ -64,8 +64,32 @@ fn rpc_error(id: Value, code: i32, message: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+
     #[test]
     fn initialized_notification_has_no_response() {
         assert!(super::dispatch(&json!({"method":"notifications/initialized"})).is_null());
+    }
+
+    #[test]
+    fn initialize_reports_protocol_and_server() {
+        let response = super::dispatch(&json!({
+            "jsonrpc":"2.0",
+            "id":7,
+            "method":"initialize",
+            "params":{}
+        }));
+        assert_eq!(response["result"]["protocolVersion"], "2024-11-05");
+        assert_eq!(response["result"]["serverInfo"]["name"], "mcp-bridge");
+    }
+
+    #[test]
+    fn unknown_method_is_json_rpc_error() {
+        let response = super::dispatch(&json!({
+            "jsonrpc":"2.0",
+            "id":8,
+            "method":"unknown"
+        }));
+        assert_eq!(response["error"]["code"], -32601);
+        assert_eq!(response["id"], 8);
     }
 }

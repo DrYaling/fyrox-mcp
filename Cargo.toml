@@ -1,5 +1,5 @@
 [workspace]
-members = ["fwok-mcp", "fyrox-mcp"]
+members = ["mcp-bridge", "fyrox-mcp"]
 resolver = "2"
 
 [workspace.dependencies]

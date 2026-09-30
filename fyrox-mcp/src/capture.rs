@@ -42,6 +42,10 @@ pub fn capture(editor: &mut fyroxed_base::Editor, params: &Value) -> Value {
     // Editor-loaded game scenes start with a 0x0 render target until the scene
     // viewer performs its next layout pass. Allocate the capture target here;
     // this does not mutate the game runtime or the Windows swapchain.
+    let previous_render_target = engine.scenes[scene_handle]
+        .rendering_options
+        .render_target
+        .clone();
     engine.scenes[scene_handle].rendering_options.render_target = Some(
         fyrox::resource::texture::TextureResource::new_render_target(
             requested_width,
@@ -57,9 +61,11 @@ pub fn capture(editor: &mut fyroxed_base::Editor, params: &Value) -> Value {
         .map(|(_, node)| node.name().to_owned())
         .collect::<Vec<_>>();
     if active_cameras.is_empty() {
+        engine.scenes[scene_handle].rendering_options.render_target = previous_render_target;
         return json!({"error":"no_active_camera"});
     }
     if camera.is_some_and(|name| !active_cameras.iter().any(|item| item == name)) {
+        engine.scenes[scene_handle].rendering_options.render_target = previous_render_target;
         return json!({"error":"camera_not_found_or_disabled","camera":camera});
     }
     // Fyrox 会按顺序渲染所有启用 Camera；指定名称时临时屏蔽其它 Camera，
@@ -81,6 +87,17 @@ pub fn capture(editor: &mut fyroxed_base::Editor, params: &Value) -> Value {
     } else {
         Vec::new()
     };
+    let cleanup =
+        |engine: &mut fyrox::engine::Engine,
+         states: &[(Handle<fyrox::scene::node::Node>, bool)],
+         previous_render_target: Option<fyrox::resource::texture::TextureResource>| {
+            for (handle, enabled) in states {
+                if let Ok(node) = engine.scenes[scene_handle].graph.try_get_mut(*handle) {
+                    node.as_camera_mut().set_enabled(*enabled);
+                }
+            }
+            engine.scenes[scene_handle].rendering_options.render_target = previous_render_target;
+        };
     let rendered = {
         let scene = &engine.scenes[scene_handle];
         let graphics = engine.graphics_context.as_initialized_mut();
@@ -92,7 +109,10 @@ pub fn capture(editor: &mut fyroxed_base::Editor, params: &Value) -> Value {
             &engine.resource_manager,
         ) {
             Ok(data) => data,
-            Err(error) => return json!({"error":format!("camera_render_failed:{error}")}),
+            Err(error) => {
+                cleanup(engine, &camera_states, previous_render_target);
+                return json!({"error":format!("camera_render_failed:{error}")});
+            }
         }
     };
     let pixels = match rendered
@@ -101,13 +121,20 @@ pub fn capture(editor: &mut fyroxed_base::Editor, params: &Value) -> Value {
         .read_pixels(ReadTarget::Color(0))
     {
         Some(pixels) => pixels,
-        None => return json!({"error":"gpu_readback_unavailable"}),
+        None => {
+            cleanup(engine, &camera_states, previous_render_target);
+            return json!({"error":"gpu_readback_unavailable"});
+        }
     };
     let (width, height) = match rendered.scene_data.ldr_scene_frame_texture().kind() {
         GpuTextureKind::Rectangle { width, height } => (width as u32, height as u32),
-        _ => return json!({"error":"camera_target_not_2d"}),
+        _ => {
+            cleanup(engine, &camera_states, previous_render_target);
+            return json!({"error":"camera_target_not_2d"});
+        }
     };
     if width < 64 || height < 64 {
+        cleanup(engine, &camera_states, previous_render_target);
         return json!({"error":"capture_framebuffer_too_small","width":width,"height":height,"detail":"Windows Editor must have a renderable viewport; minimized/headless 1x1 framebuffer is not valid screenshot evidence"});
     }
     let row_bytes = width as usize * 4;
@@ -115,6 +142,7 @@ pub fn capture(editor: &mut fyroxed_base::Editor, params: &Value) -> Value {
     // OpenGL 读回失败时驱动可能返回长度不完整的缓冲区。先验证边界，避免 MCP
     // 请求将 Editor 主线程带入切片 panic；调用方会得到可诊断的 JSON 错误。
     if pixels.len() != expected_pixel_bytes {
+        cleanup(engine, &camera_states, previous_render_target);
         return json!({
             "error":"gpu_readback_size_mismatch",
             "actual_bytes":pixels.len(),
@@ -132,13 +160,10 @@ pub fn capture(editor: &mut fyroxed_base::Editor, params: &Value) -> Value {
         .write_image(&top_down, width, height, image::ExtendedColorType::Rgba8)
         .is_err()
     {
+        cleanup(engine, &camera_states, previous_render_target);
         return json!({"error":"png_encode_failed"});
     }
-    for (handle, enabled) in camera_states {
-        if let Ok(node) = engine.scenes[scene_handle].graph.try_get_mut(handle) {
-            node.as_camera_mut().set_enabled(enabled);
-        }
-    }
+    cleanup(engine, &camera_states, previous_render_target);
     let file_name = params
         .get("file_name")
         .or_else(|| params.get("fileName"))

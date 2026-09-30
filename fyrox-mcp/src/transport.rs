@@ -10,6 +10,8 @@ use std::{
     thread,
 };
 
+const MAX_PENDING_REQUESTS: usize = 256;
+
 pub fn start() -> Arc<Mutex<VecDeque<PendingRequest>>> {
     let queue = Arc::new(Mutex::new(VecDeque::new()));
     let listener_queue = queue.clone();
@@ -40,11 +42,15 @@ fn serve(mut stream: TcpStream, queue: Arc<Mutex<VecDeque<PendingRequest>>>) {
             break;
         };
         let (sender, receiver) = mpsc::channel();
-        if queue
-            .lock()
-            .map(|mut value| value.push_back((request, sender)))
-            .is_err()
-        {
+        let queued = queue.lock().map(|mut value| {
+            if value.len() >= MAX_PENDING_REQUESTS {
+                false
+            } else {
+                value.push_back((request, sender));
+                true
+            }
+        });
+        if !matches!(queued, Ok(true)) {
             break;
         }
         let Ok(response) = receiver.recv() else { break };

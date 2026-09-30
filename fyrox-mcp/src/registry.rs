@@ -116,7 +116,15 @@ fn public_tool_method(tool: &str) -> &str {
         "fwok_read_texture" => "texture_read",
         "fwok_manage_scene" => "manage_scene",
         "fwok_manage_nodes" => "manage_nodes",
+        "find_gameobjects" => "find_gameobjects",
+        "manage_gameobject" => "manage_gameobject",
+        "manage_camera" => "manage_camera",
+        "manage_prefab" => "manage_prefab",
         "manage_ui" => "manage_ui",
+        "manage_asset" => "manage_asset",
+        "manage_script" => "manage_script",
+        "manage_editor" => "manage_editor",
+        "read_console" => "read_console",
         other => other,
     }
 }

@@ -1481,13 +1481,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fwok-mcp"
-version = "0.1.0"
-dependencies = [
- "serde_json",
-]
-
-[[package]]
 name = "fxhash"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2674,6 +2667,13 @@ checksum = "8ea1f30cedd69f0a2954655f7188c6a834246d2bcf1e315e2ac40c4b24dc9519"
 dependencies = [
  "cfg-if",
  "rayon",
+]
+
+[[package]]
+name = "mcp-bridge"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]

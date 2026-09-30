@@ -3,7 +3,9 @@ use crate::{assets, capture, logs, manage, scene};
 use fyrox::{
     core::{
         algebra::{UnitQuaternion, Vector3},
+        math::{Matrix4Ext, Rect},
         pool::Handle,
+        SafeLock,
     },
     graph::SceneGraph,
     resource::model::{Model, ModelResourceExtension},
@@ -158,9 +160,9 @@ pub fn manage_prefab(editor: &mut Editor, params: &Value) -> Value {
                 Err(e) => json!({"error":e.to_string()}),
             }
         }
-        "duplicate" => prefab_copy(params, false),
-        "rename" | "move" => prefab_copy(params, true),
-        "modify" => modify_prefab_file(params),
+        "duplicate" => prefab_copy(editor, params, false),
+        "rename" | "move" => move_prefab(editor, params),
+        "modify" => modify_prefab_file(editor, params),
         "delete" => {
             let Some(path) = prefab_path(
                 params
@@ -170,9 +172,7 @@ pub fn manage_prefab(editor: &mut Editor, params: &Value) -> Value {
             ) else {
                 return json!({"error":"invalid_prefab_path"});
             };
-            fs::remove_file(&path)
-                .map(|_| json!({"success":true,"deleted":norm(&path)}))
-                .unwrap_or_else(|e| json!({"error":e.to_string()}))
+            delete_prefab(editor, &path)
         }
         "add_to_scene" => add_prefab_to_scene(editor, params),
         "remove_from_scene" => remove_prefab_from_scene(editor, params),
@@ -182,7 +182,7 @@ pub fn manage_prefab(editor: &mut Editor, params: &Value) -> Value {
     }
 }
 
-fn modify_prefab_file(params: &Value) -> Value {
+fn modify_prefab_file(editor: &mut Editor, params: &Value) -> Value {
     let Some(path) = prefab_path(params.get("path").and_then(Value::as_str)) else {
         return json!({"error":"invalid_prefab_path"});
     };
@@ -192,12 +192,89 @@ fn modify_prefab_file(params: &Value) -> Value {
     if !content.starts_with("FTAX:") {
         return json!({"error":"prefab_serialization_header_required"});
     }
-    fs::write(&path, content.as_bytes())
-        .map(|_| json!({"success":true,"action":"modify","path":norm(&path),"bytes":content.len(),"resource_id_preserved":true}))
-        .unwrap_or_else(|e| json!({"error":e.to_string()}))
+    let metadata = PathBuf::from(format!("{}.meta", path.to_string_lossy()));
+    if !metadata.exists() {
+        return json!({"error":"prefab_metadata_missing","detail":"Refusing raw replacement because resource identity cannot be verified."});
+    }
+    let tmp = path.with_extension("rgs.mcp-tmp");
+    if let Err(e) = fs::write(&tmp, content.as_bytes()) {
+        return json!({"error":e.to_string()});
+    }
+    match fs::rename(&tmp, &path) {
+        Ok(()) => {
+            let reloaded = {
+                let mut state = editor.engine.resource_manager.state();
+                state.try_reload_resource_from_path(&path)
+            };
+            json!({"success":true,"action":"modify","path":norm(&path),"bytes":content.len(),"resource_id_preserved":true,"resource_reloaded":reloaded})
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            json!({"error":e.to_string()})
+        }
+    }
 }
 
-fn prefab_copy(params: &Value, moving: bool) -> Value {
+fn delete_prefab(editor: &mut Editor, path: &Path) -> Value {
+    let state = editor.engine.resource_manager.state();
+    if state
+        .resource_registry
+        .safe_lock()
+        .path_to_uuid(path)
+        .is_none()
+    {
+        return json!({"error":"prefab_not_registered","path":norm(path)});
+    }
+    if let Err(error) = state.resource_io.delete_file_sync(path) {
+        return json!({"error":format!("prefab_delete_failed:{error}")});
+    }
+    let cleanup = match state
+        .resource_registry
+        .safe_lock()
+        .modify()
+        .remove_metadata(path)
+    {
+        Ok(()) => {
+            json!({"success":true,"action":"delete","deleted":norm(path),"registry_updated":true})
+        }
+        Err(error) => {
+            json!({"error":format!("prefab_registry_cleanup_failed:{error}"),"deleted":true})
+        }
+    };
+    cleanup
+}
+
+fn move_prefab(editor: &mut Editor, params: &Value) -> Value {
+    let Some(source) = prefab_path(
+        params
+            .get("source")
+            .or_else(|| params.get("path"))
+            .and_then(Value::as_str),
+    ) else {
+        return json!({"error":"invalid_prefab_source"});
+    };
+    let Some(destination) = prefab_path(
+        params
+            .get("destination")
+            .or_else(|| params.get("new_path"))
+            .and_then(Value::as_str),
+    ) else {
+        return json!({"error":"invalid_prefab_destination"});
+    };
+    match fyrox::core::futures::executor::block_on(
+        editor
+            .engine
+            .resource_manager
+            .move_resource_by_path(&source, &destination, false),
+    ) {
+        Ok(()) => {
+            json!({"success":true,"source":norm(&source),"destination":norm(&destination),"resource_id_preserved":true})
+        }
+        Err(e) => json!({"error":format!("prefab_move_failed:{e}")}),
+    }
+}
+
+fn prefab_copy(editor: &mut Editor, params: &Value, moving: bool) -> Value {
     let Some(source) = prefab_path(
         params
             .get("source")
@@ -215,14 +292,21 @@ fn prefab_copy(params: &Value, moving: bool) -> Value {
         return json!({"error":"invalid_prefab_destination"});
     };
     if let Some(parent) = destination.parent() {
-        let _ = fs::create_dir_all(parent);
+        if let Err(e) = fs::create_dir_all(parent) {
+            return json!({"error":e.to_string()});
+        }
     }
     let result = if moving {
         fs::rename(&source, &destination).map(|_| ())
     } else {
         fs::copy(&source, &destination).map(|_| ())
     };
-    result.map(|_| json!({"success":true,"source":norm(&source),"destination":norm(&destination),"resource_bytes_preserved":true})).unwrap_or_else(|e| json!({"error":e.to_string()}))
+    result.map(|_| {
+        if !moving {
+            editor.engine.resource_manager.update_or_load_registry();
+        }
+        json!({"success":true,"source":norm(&source),"destination":norm(&destination),"resource_bytes_preserved":true,"resource_id_preserved":false,"detail":"A duplicated resource must receive a new metadata UUID; registry refresh will assign it on next scan."})
+    }).unwrap_or_else(|e| json!({"error":e.to_string()}))
 }
 
 fn add_prefab_to_scene(editor: &mut Editor, params: &Value) -> Value {
@@ -336,6 +420,7 @@ fn focus_camera_target(editor: &mut Editor, params: &Value) -> Value {
     else {
         return json!({"error":"camera_not_found","camera":camera_name});
     };
+    graph.update_hierarchical_data();
     let center = graph[target].global_position();
     let yaw = yaw.to_radians();
     let pitch = pitch.to_radians().clamp(-1.55, 1.55);
@@ -344,16 +429,33 @@ fn focus_camera_target(editor: &mut Editor, params: &Value) -> Value {
         pitch.sin(),
         yaw.cos() * pitch.cos(),
     ) * distance;
-    let position = center + offset;
-    graph[camera]
-        .local_transform_mut()
-        .set_position(position)
-        .set_rotation(UnitQuaternion::face_towards(
-            &(position - center),
-            &Vector3::y(),
-        ));
+    let position = json_vec3(params.get("position"))
+        .or_else(|| {
+            let xyz = [params.get("x"), params.get("y"), params.get("z")];
+            xyz.iter().all(Option::is_some).then(|| {
+                Vector3::new(
+                    xyz[0].and_then(Value::as_f64).unwrap_or_default() as f32,
+                    xyz[1].and_then(Value::as_f64).unwrap_or_default() as f32,
+                    xyz[2].and_then(Value::as_f64).unwrap_or_default() as f32,
+                )
+            })
+        })
+        .unwrap_or(center + offset);
+    let rotation = json_vec3(params.get("rotation"))
+        .map(|euler| {
+            UnitQuaternion::from_euler_angles(
+                euler.x.to_radians(),
+                euler.y.to_radians(),
+                euler.z.to_radians(),
+            )
+        })
+        .unwrap_or_else(|| UnitQuaternion::face_towards(&(position - center), &Vector3::y()));
+    graph.set_global_position(camera, position);
+    graph.set_global_rotation(camera, rotation);
     graph.update_hierarchical_data();
-    json!({"success":true,"camera":graph[camera].name(),"target_node":graph[target].name(),"position":[position.x,position.y,position.z],"distance":distance,"yaw":params.get("yaw").and_then(Value::as_f64).unwrap_or(0.0),"pitch":params.get("pitch").and_then(Value::as_f64).unwrap_or(15.0)})
+    graph.update_hierarchical_data();
+    let actual = graph[camera].global_position();
+    json!({"success":true,"camera":graph[camera].name(),"target_node":graph[target].name(),"position":[actual.x,actual.y,actual.z],"distance":distance,"yaw":params.get("yaw").and_then(Value::as_f64).unwrap_or(0.0),"pitch":params.get("pitch").and_then(Value::as_f64).unwrap_or(15.0)})
 }
 
 /// Temporarily apply camera projection/viewport overrides, capture, then restore all camera state.
@@ -396,6 +498,20 @@ fn configure_for_capture(editor: &mut Editor, params: &Value) -> Value {
     if let Some(enabled) = params.get("enabled").and_then(Value::as_bool) {
         graph[handle].as_camera_mut().set_enabled(enabled);
     }
+    if let Some(viewport) = params.get("viewport").and_then(Value::as_array) {
+        if viewport.len() != 4 || viewport.iter().any(|value| value.as_f64().is_none()) {
+            graph[handle].as_camera_mut().set_projection(old_projection);
+            graph[handle].as_camera_mut().set_viewport(old_viewport);
+            graph[handle].as_camera_mut().set_enabled(old_enabled);
+            return json!({"error":"viewport_must_be_four_numbers"});
+        }
+        graph[handle].as_camera_mut().set_viewport(Rect::new(
+            viewport[0].as_f64().unwrap() as f32,
+            viewport[1].as_f64().unwrap() as f32,
+            viewport[2].as_f64().unwrap() as f32,
+            viewport[3].as_f64().unwrap() as f32,
+        ));
+    }
     let mut shot_params = params.clone();
     shot_params["camera"] = json!(graph[handle].name());
     shot_params["file_name"] = params
@@ -435,14 +551,22 @@ fn set_camera_target(editor: &mut Editor, params: &Value) -> Value {
     else {
         return json!({"error":"camera_not_found","camera":camera_name});
     };
+    graph.update_hierarchical_data();
     let position = graph[handle].global_position();
     let direction = target - position;
     if direction.norm_squared() <= f32::EPSILON {
         return json!({"error":"camera_and_target_positions_are_equal"});
     }
     let rotation = UnitQuaternion::face_towards(&-direction, &Vector3::y());
-    graph[handle].local_transform_mut().set_rotation(rotation);
-    let (roll, pitch, yaw) = graph[handle].local_transform().rotation().euler_angles();
+    graph.set_global_rotation(handle, rotation);
+    graph.update_hierarchical_data();
+    let rotation = UnitQuaternion::from_matrix_eps(
+        &graph[handle].global_transform_without_scaling().basis(),
+        10.0 * f32::EPSILON,
+        16,
+        UnitQuaternion::identity(),
+    );
+    let (roll, pitch, yaw) = rotation.euler_angles();
     json!({
         "success":true,
         "camera":graph[handle].name(),
@@ -483,12 +607,18 @@ fn screenshot_multiview(editor: &mut Editor, params: &Value) -> Value {
     let resolved_name = editor.engine.scenes[scene_handle].graph[handle]
         .name()
         .to_owned();
-    let old_position = **editor.engine.scenes[scene_handle].graph[handle]
-        .local_transform()
-        .position();
-    let old_rotation = **editor.engine.scenes[scene_handle].graph[handle]
-        .local_transform()
-        .rotation();
+    editor.engine.scenes[scene_handle]
+        .graph
+        .update_hierarchical_data();
+    let old_position = editor.engine.scenes[scene_handle].graph[handle].global_position();
+    let old_rotation = UnitQuaternion::from_matrix_eps(
+        &editor.engine.scenes[scene_handle].graph[handle]
+            .global_transform_without_scaling()
+            .basis(),
+        10.0 * f32::EPSILON,
+        16,
+        UnitQuaternion::identity(),
+    );
     let requested = params
         .get("views")
         .and_then(Value::as_array)
@@ -508,15 +638,13 @@ fn screenshot_multiview(editor: &mut Editor, params: &Value) -> Value {
             }
         };
         let position = target + offset;
-        {
-            let node = &mut editor.engine.scenes[scene_handle].graph[handle];
-            node.local_transform_mut()
-                .set_position(position)
-                .set_rotation(UnitQuaternion::face_towards(
-                    &(position - target),
-                    &Vector3::y(),
-                ));
-        }
+        let rotation = UnitQuaternion::face_towards(&(position - target), &Vector3::y());
+        editor.engine.scenes[scene_handle]
+            .graph
+            .set_global_position(handle, position);
+        editor.engine.scenes[scene_handle]
+            .graph
+            .set_global_rotation(handle, rotation);
         // `render_scene` consumes cached global transforms.  MCP edits happen
         // outside the normal editor update tick, so refresh the graph before
         // each readback; otherwise every requested view renders the old pose.
@@ -529,10 +657,15 @@ fn screenshot_multiview(editor: &mut Editor, params: &Value) -> Value {
         let shot = capture::capture(editor, &shot_params);
         captures.push(json!({"view":view,"position":[position.x,position.y,position.z],"target_position":[target.x,target.y,target.z],"image":shot}));
     }
-    editor.engine.scenes[scene_handle].graph[handle]
-        .local_transform_mut()
-        .set_position(old_position)
-        .set_rotation(old_rotation);
+    editor.engine.scenes[scene_handle]
+        .graph
+        .set_global_position(handle, old_position);
+    editor.engine.scenes[scene_handle]
+        .graph
+        .set_global_rotation(handle, old_rotation);
+    editor.engine.scenes[scene_handle]
+        .graph
+        .update_hierarchical_data();
     json!({"success":captures.iter().all(|item| item.get("error").is_none() && item.pointer("/image/error").is_none()),"camera":resolved_name,"restored":true,"captures":captures})
 }
 
