@@ -50,7 +50,16 @@ fn call_tool(request: &Value, id: Value) -> Value {
             json!({"jsonrpc":"2.0","id":id,"result":{"content":bridge::content(&result),"structuredContent":result}})
         }
         Err(error) => {
-            json!({"jsonrpc":"2.0","id":id,"result":{"isError":true,"content":[{"type":"text","text":error}]}})
+            let detail = error.clone();
+            json!({
+                "jsonrpc":"2.0",
+                "id":id,
+                "result":{
+                    "isError":true,
+                    "content":[{"type":"text","text":detail}],
+                    "structuredContent":{"success":false,"error":error,"retryable":false}
+                }
+            })
         }
     }
 }
@@ -91,5 +100,17 @@ mod tests {
         }));
         assert_eq!(response["error"]["code"], -32601);
         assert_eq!(response["id"], 8);
+    }
+
+    #[test]
+    fn unknown_tool_is_protocol_error() {
+        let response = super::dispatch(&json!({
+            "jsonrpc":"2.0",
+            "id":9,
+            "method":"tools/call",
+            "params":{"name":"does_not_exist","arguments":{}}
+        }));
+        assert_eq!(response["error"]["code"], -32602);
+        assert_eq!(response["id"], 9);
     }
 }

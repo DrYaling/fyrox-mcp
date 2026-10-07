@@ -79,7 +79,15 @@ pub fn manage_gameobject(editor: &mut Editor, params: &Value) -> Value {
             if t.is_none() && e.is_none() {
                 json!({"error":"modify_requires_transform_or_enabled"})
             } else {
-                json!({"success":true,"target":name,"transform":t,"enabled":e})
+                let transform_ok = t
+                    .as_ref()
+                    .map(|value| value.get("error").is_none())
+                    .unwrap_or(true);
+                let enabled_ok = e
+                    .as_ref()
+                    .map(|value| value.get("error").is_none())
+                    .unwrap_or(true);
+                json!({"success":transform_ok && enabled_ok,"target":name,"transform":t,"enabled":e})
             }
         }
         "get" | "get_info" => scene::find(editor, &json!({"name":name})),
@@ -129,7 +137,7 @@ pub fn manage_gameobject(editor: &mut Editor, params: &Value) -> Value {
 pub fn manage_camera(editor: &mut Editor, params: &Value) -> Value {
     match params.get("action").and_then(Value::as_str).unwrap_or("") {
         "ping" => json!({"success":true,"backend":"fyrox_camera","cinemachine":false}),
-        "list_cameras" => scene::cameras(editor),
+        "list_cameras" => scene::cameras(editor, params),
         "create_camera" => manage::create_nodes(
             editor,
             &json!({"nodes":[{"name":params.get("name").and_then(Value::as_str).unwrap_or("Camera"),"kind":"camera","position":params.get("position").cloned().unwrap_or(json!([0,0,0])),"rotation":params.get("rotation").cloned().unwrap_or(json!([0,0,0]))}]}),

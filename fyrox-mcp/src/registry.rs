@@ -9,13 +9,22 @@ pub fn execute(request: &Value, editor: &mut Editor) -> Value {
     let command = Command::parse(request);
     let data = match command.method {
         "ping" => {
-            json!({"ok":true,"engine":"fyrox-editor","platform":"windows","protocol":"fwok-editor-bridge/2","framing":"uint64be"})
+            let mut value = crate::transport::diagnostics();
+            if let Some(object) = value.as_object_mut() {
+                object.insert("ok".into(), json!(true));
+                object.insert("engine".into(), json!("fyrox-editor"));
+                object.insert("platform".into(), json!("windows"));
+                object.insert("protocol".into(), json!("fwok-editor-bridge/2"));
+                object.insert("framing".into(), json!("uint64be"));
+                object.insert("active_resource".into(), project::info(editor));
+            }
+            value
         }
         "project_info" => project::info(editor),
-        "scene_tree" => scene::tree(editor),
-        "scene_stats" => scene::stats(editor),
+        "scene_tree" => scene::tree(editor, &command.params),
+        "scene_stats" => scene::stats(editor, &command.params),
         "scene_selection" => scene::selection(editor),
-        "scene_cameras" => scene::cameras(editor),
+        "scene_cameras" => scene::cameras(editor, &command.params),
         "scene_find" => scene::find(editor, &command.params),
         "scene_set_transform" => scene::set_transform(editor, &command.params),
         "scene_set_enabled" => scene::set_enabled(editor, &command.params),
@@ -35,6 +44,12 @@ pub fn execute(request: &Value, editor: &mut Editor) -> Value {
         "manage_editor" => compatibility::manage_editor(editor, &command.params),
         "read_console" => compatibility::read_console(&command.params),
         "batch_execute" => batch_execute(editor, &command.params),
+        method if method.starts_with("unsupported_batch_") => json!({
+            "success": false,
+            "error": "batch_operation_not_supported",
+            "operation": method.strip_prefix("unsupported_batch_").unwrap_or(method),
+            "retryable": false
+        }),
         _ => json!({"error":format!("unknown_editor_method:{}", command.method)}),
     };
     response::success(command.id, data)
@@ -51,6 +66,10 @@ fn batch_execute(editor: &mut Editor, params: &Value) -> Value {
     }
     let fail_fast = params
         .get("failFast")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let parallel_requested = params
+        .get("parallel")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let mut results = Vec::with_capacity(commands.len());
@@ -76,7 +95,9 @@ fn batch_execute(editor: &mut Editor, params: &Value) -> Value {
             continue;
         }
         let method = public_tool_method(tool);
-        let request = json!({"id": results.len(), "method": method, "params": object.get("params").cloned().unwrap_or_else(|| json!({}))});
+        let mut params = object.get("params").cloned().unwrap_or_else(|| json!({}));
+        resolve_result_refs(&mut params, &results);
+        let request = json!({"id": results.len(), "method": method, "params": params});
         let response = execute(&request, editor);
         let result = response.get("result").cloned().unwrap_or(response);
         let success = result.get("error").is_none()
@@ -93,7 +114,42 @@ fn batch_execute(editor: &mut Editor, params: &Value) -> Value {
             break;
         }
     }
-    json!({"success":failures == 0,"results":results,"callSuccessCount":results.len()-failures,"callFailureCount":failures,"parallelApplied":false})
+    json!({"success":failures == 0,"results":results,"callSuccessCount":results.len()-failures,"callFailureCount":failures,"parallelRequested":parallel_requested,"parallelApplied":false,"executionMode":"serialized_editor_main_thread"})
+}
+
+/// Resolve the intentionally small `$result[n].field` syntax used by Unity
+/// style command batches. References can only point to earlier successful
+/// results, preventing recursive or cross-request execution.
+fn resolve_result_refs(value: &mut Value, results: &[Value]) {
+    match value {
+        Value::String(text) if text.starts_with("$result[") => {
+            let Some(close) = text.find(']') else {
+                return;
+            };
+            let Ok(index) = text[8..close].parse::<usize>() else {
+                return;
+            };
+            let Some(result) = results.get(index).and_then(|item| item.get("result")) else {
+                return;
+            };
+            let path = text.get(close + 1..).unwrap_or("").strip_prefix('.');
+            let resolved = path
+                .map(|path| {
+                    path.split('.')
+                        .fold(result, |node, key| node.get(key).unwrap_or(&Value::Null))
+                })
+                .cloned()
+                .unwrap_or_else(|| result.clone());
+            *value = resolved;
+        }
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| resolve_result_refs(item, results)),
+        Value::Object(items) => items
+            .values_mut()
+            .for_each(|item| resolve_result_refs(item, results)),
+        _ => {}
+    }
 }
 
 /// Batch entries use public MCP names, while the editor registry uses concise
@@ -107,6 +163,10 @@ fn public_tool_method(tool: &str) -> &str {
         "fwok_scene_selection" => "scene_selection",
         "fwok_cameras" => "scene_cameras",
         "fwok_project_info" => "project_info",
+        // These bridge-level helpers perform bounded polling or multi-step
+        // preview orchestration and cannot run inside an Editor batch.
+        "fwok_wait_for_resource" => "unsupported_batch_wait_for_resource",
+        "fwok_preview_resource" => "unsupported_batch_preview_resource",
         "fwok_find_node" => "scene_find",
         "fwok_set_transform" => "scene_set_transform",
         "fwok_set_enabled" => "scene_set_enabled",
@@ -126,5 +186,21 @@ fn public_tool_method(tool: &str) -> &str {
         "manage_editor" => "manage_editor",
         "read_console" => "read_console",
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_result_refs;
+    use serde_json::json;
+
+    #[test]
+    fn resolves_previous_result_field_only() {
+        let results = vec![json!({"result":{"path":"data/realm.rgs","meta":{"ready":true}}})];
+        let mut params = json!({"scene_path":"$result[0].path","ready":"$result[0].meta.ready","future":"$result[1].path"});
+        resolve_result_refs(&mut params, &results);
+        assert_eq!(params["scene_path"], "data/realm.rgs");
+        assert_eq!(params["ready"], true);
+        assert_eq!(params["future"], "$result[1].path");
     }
 }

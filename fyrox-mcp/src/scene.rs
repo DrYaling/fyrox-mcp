@@ -13,17 +13,38 @@ use serde_json::{json, Value};
 
 /// 取得当前活动的游戏场景句柄；参数为 Editor，返回不存在或 UI 场景时的 None。
 pub(crate) fn active_handle(editor: &Editor) -> Option<Handle<Scene>> {
+    game_handle(editor, None)
+}
+
+/// Resolve a loaded game scene by serialized path. This keeps UI and 3D scene
+/// inspection independent when both are open in the editor.
+pub(crate) fn game_handle(editor: &Editor, requested: Option<&str>) -> Option<Handle<Scene>> {
+    let matches = |path: &Option<std::path::PathBuf>| {
+        requested.map_or(true, |wanted| {
+            let wanted = wanted.replace('\\', "/");
+            path.as_ref()
+                .map(|value| {
+                    let value = value.to_string_lossy().replace('\\', "/");
+                    value == wanted || value.ends_with(&format!("/{wanted}"))
+                })
+                .unwrap_or(false)
+        })
+    };
     editor
         .scenes
-        .current_scene_entry_ref()
-        .controller
-        .downcast_ref::<GameScene>()
-        .map(|scene| scene.scene)
+        .iter()
+        .find(|entry| matches(&entry.path))
+        .and_then(|entry| {
+            entry
+                .controller
+                .downcast_ref::<GameScene>()
+                .map(|scene| scene.scene)
+        })
 }
 
 /// 导出当前活动游戏场景节点树；参数为 Editor，返回 JSON 场景树或错误对象。
-pub fn tree(editor: &Editor) -> Value {
-    let Some(handle) = active_handle(editor) else {
+pub fn tree(editor: &Editor, params: &Value) -> Value {
+    let Some(handle) = game_handle(editor, params.get("scene_path").and_then(Value::as_str)) else {
         return json!({"error":"active_game_scene_not_found"});
     };
     let scene = &editor.engine.scenes[handle];
@@ -31,8 +52,8 @@ pub fn tree(editor: &Editor) -> Value {
 }
 
 /// Return compact counts and depth information for the active serialized scene.
-pub fn stats(editor: &Editor) -> Value {
-    let Some(handle) = active_handle(editor) else {
+pub fn stats(editor: &Editor, params: &Value) -> Value {
+    let Some(handle) = game_handle(editor, params.get("scene_path").and_then(Value::as_str)) else {
         return json!({"error":"active_game_scene_not_found"});
     };
     let graph = &editor.engine.scenes[handle].graph;
@@ -72,8 +93,8 @@ pub fn selection(editor: &Editor) -> Value {
 }
 
 /// 列出活动场景摄像机；参数为 Editor，返回摄像机数组或错误对象。
-pub fn cameras(editor: &Editor) -> Value {
-    let Some(handle) = active_handle(editor) else {
+pub fn cameras(editor: &Editor, params: &Value) -> Value {
+    let Some(handle) = game_handle(editor, params.get("scene_path").and_then(Value::as_str)) else {
         return json!({"error":"active_game_scene_not_found"});
     };
     let scene = &editor.engine.scenes[handle];

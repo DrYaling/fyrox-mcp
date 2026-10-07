@@ -16,9 +16,9 @@ This standalone workspace contains two cooperating crates: `mcp-bridge` and `fyr
 
 ### `fyrox-mcp`
 
-`fyrox-mcp` is the Fyrox EditorPlugin. It owns the editor-thread command queue, executes scene/UI/asset operations on the editor thread, reads diagnostics and screenshots, and returns structured results to the bridge.
+`fyrox-mcp` is the Fyrox EditorPlugin. It owns the editor-thread command queue, executes scene/UI/asset operations on the editor thread, reads diagnostics and screenshots, and returns structured results to the bridge. It also owns optional MCP tool auto-start: discovery, port probing, project working-directory selection, and shutdown of a child process started by the plugin live in this crate, so individual Editor executables only register `McpEditorPlugin`.
 
-`fyrox-mcp` 是 Fyrox EditorPlugin。它维护编辑器线程命令队列，在编辑器线程执行场景/UI/资源操作，读取诊断信息和截图，并向桥接层返回结构化结果。
+`fyrox-mcp` 是 Fyrox EditorPlugin。它维护编辑器线程命令队列，在编辑器线程执行场景/UI/资源操作，读取诊断信息和截图，并向桥接层返回结构化结果。它还负责可选的 MCP 工具自动启动：工具搜索、端口探测、项目工作目录选择和插件启动子进程的退出回收都位于该 crate，具体 Editor 可执行程序只需注册 `McpEditorPlugin`。
 
 ## Covered Capabilities / 功能范围
 
